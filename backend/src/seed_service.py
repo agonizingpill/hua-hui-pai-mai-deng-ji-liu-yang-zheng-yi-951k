@@ -1,10 +1,25 @@
-from sqlalchemy import select,func
+from sqlalchemy import select,func,text,inspect
 from .db import Base,engine,Session
 from .models import *
 from .auth import hashed
 
-def seed():
+def ensure_columns():
+    """旧演示库补可靠估级流水线的新列（幂等）。"""
     Base.metadata.create_all(engine)
+    insp = inspect(engine)
+    cols = {c['name'] for c in insp.get_columns('vase_samples')}
+    additions = {
+        'compute_generation': 'INTEGER NOT NULL DEFAULT 1',
+        'enqueued_at': 'VARCHAR(30)',
+        'heartbeat_at': 'VARCHAR(30)',
+    }
+    with engine.begin() as conn:
+        for name, ddl in additions.items():
+            if name not in cols:
+                conn.execute(text(f'ALTER TABLE vase_samples ADD COLUMN {name} {ddl}'))
+
+def seed():
+    ensure_columns()
     with Session()as s:
         for role in ('operator','supervisor','viewer'):
             if not s.scalar(select(User.id).where(User.email==role+'@chenlu.demo')):s.add(User(email=role+'@chenlu.demo',password_hash=hashed('Flowers2026!'),role=role))

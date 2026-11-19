@@ -1,6 +1,7 @@
 from sqlalchemy import Column,Integer,String,Float,Boolean,ForeignKey,JSON,UniqueConstraint,CheckConstraint
 from .db import Base
 from .constants import SAMPLE_STATES,LOT_STATES
+from .artifacts import artifact_matches
 class User(Base):
     __tablename__='users'
     id=Column(Integer,primary_key=True);email=Column(String(100),unique=True,nullable=False);password_hash=Column(String(220),nullable=False);role=Column(String(30),nullable=False)
@@ -17,6 +18,16 @@ class Consignment(Base):
 class VaseSample(Base):
     __tablename__='vase_samples'
     id=Column(Integer,primary_key=True);consignment_id=Column(Integer,ForeignKey('consignments.id'),nullable=False);code=Column(String(60),unique=True,nullable=False);maturity=Column(Float,nullable=False);stem_cm=Column(Float,nullable=False);cold_hours=Column(Float,nullable=False);observed_days=Column(Float,nullable=True);state=Column(String(20),default=SAMPLE_STATES[0]);prediction=Column(JSON);error=Column(String(450));approved_grade=Column(String(2));review_note=Column(String(250))
+    # 可靠估级流水线：compute_generation 标识当前这一代计算，入队/补算时 +1；
+    # 晚回来的旧计算代际对不上，结果作废，不覆盖已补好的估值与归档。
+    compute_generation=Column(Integer,nullable=False,default=1,server_default='1')
+    # 入队与 worker 心跳时间（业务无关的墙钟），恢复器据此识别丢消息/硬崩溃的单子。
+    enqueued_at=Column(String(30),nullable=True);heartbeat_at=Column(String(30),nullable=True)
+
+    @property
+    def artifact_ready(self):
+        """估值与归档齐了、且归档与当前代际同一次计算，才可交主管核级。"""
+        return self.state=='ready' and self.prediction is not None and artifact_matches(self)
 class AuctionSession(Base):
     __tablename__='auction_sessions'
     id=Column(Integer,primary_key=True);code=Column(String(60),unique=True,nullable=False);opens_at=Column(String(20),nullable=False);closes_at=Column(String(20),nullable=False)

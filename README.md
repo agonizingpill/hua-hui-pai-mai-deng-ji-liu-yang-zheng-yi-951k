@@ -26,7 +26,7 @@ JWT8小时，PBKDF2盐化口令；Trace中间件请求ID、Burst每IP每分钟36
 ## 六个业务模块
 
 1. **采切批次与到场分筐**：Consignment唯一code，种植户/品种/采切与到场时间/筐数/每筐支数。到场必须在采切后48小时内且不晚于业务时钟。数量建立后不可任意改写，主管只能修筐贴备注。挂场和成交合计占筐不得超实收。
-2. **瓶插留样与寿命估级**：VaseSample关联到场单，唯一留样签，成熟度、杆长、冷藏小时不得超过采后小时。recorded→queued→running→ready或failed，worker真实估级后主管核定A/B/C，保留模型建议与人工核级。实际瓶插终点只能封存一次；争议使用冻结快照，不覆盖旧证据。
+2. **瓶插留样与寿命估级**：VaseSample关联到场单，唯一留样签，成熟度、杆长、冷藏小时不得超过采后小时。recorded→queued→running→ready或failed，worker真实估级后主管核定A/B/C，保留模型建议与人工核级。队列消息带`compute_generation`代际token，入队/补算即+1；worker周期恢复器把丢消息的queued（超时未领取）和硬崩溃的running（心跳超时）自动补送，心跳新鲜的正常计算照常等。处理前锁行复查状态与代际，重试不重复出估级，晚回来的旧计算代际对不上即丢弃，不覆盖已补好的结果。估值DB记录与`/artifacts/grade-ID.json`归档必须同代齐备（`artifact_ready`）才允许主管核级；实际瓶插终点只能封存一次；争议使用冻结快照，不覆盖旧证据。留样页面按代际与归档标志展示排队等候、补算（补算排队/补算中）、可以核级三类流水线状态。
 3. **拍卖场次和底价**：AuctionSession设开场/截止，AuctionLot关联本批已核级留样和场次。A最低80元/筐、B55元、C30元。挂场先锁Consignment父行，再计算所有未撤场标的占筐。未评级、低底价、超余筐或已截止拒绝。未出价未成交标的可主管撤场释放额度，有出价不得撤场。
 4. **竞价与成交锁筐**：Bid须在`opens_at ≤ clock < closes_at`时提交，达到底价并严格高于当前最高价。同父行→场次→业务时钟→标的锁序，避免并发报价检查窗口。主管只能在截止后一次截标，最高价Bid生成唯一Deal；无报价不成交，需撤场。成交冻结买方、单价、筐数与原等级，不能再次出售。
 5. **留样争议和复判**：Deal必须已有实际留样天数才可开Dispute，每成交只允许一条未决争议。主管复判不得上调现有效等级，也不得高于冻结终点对应级别（≥10天A、≥7天B、否则C）。复判只追加修订，推进Deal.revision，旧draft结算作废；已付记录保留。
@@ -38,7 +38,7 @@ JWT8小时，PBKDF2盐化口令；Trace中间件请求ID、Burst每IP每分钟36
 
 `backend/src/grading.py`固定NumPy seed35生成200条合成花卉观测：成熟度0.1–1、杆长35–90cm、采后1–40h、冷藏0–25h；目标`clip(14−6×成熟度+.04×(杆长−50)−.13×采后小时+.09×冷藏小时+N(0,.35),2,20)`。先固定拆分150训练/50留出，GradientBoostingRegressor（80树、深度2、seed35）仅拟合训练集，输出留出MAE天数、预测瓶插天数与A/B/C建议。保留源数据SHA256、训练/留出索引与输入快照；不是实际客户农业样本，模型不替代验级员判断。
 
-接口将留样ID送Redis，worker计算真实sklearn结果，DB prediction与`/artifacts/grade-ID.json`共享卷落盘。故障记录failed/error，Redis恢复后可同记录重试。未实现worker硬崩溃后的running自动回收，不能声称可靠消息投递。
+接口将留样ID与代际token送Redis，worker计算真实sklearn结果，DB prediction与`/artifacts/grade-ID.json`共享卷原子落盘（临时文件+rename，内含同一`compute_generation`）。故障记录failed/error，Redis恢复后可同记录重试。worker每5秒扫描：`queued`超过`GRADE_QUEUE_STALE_SECONDS`（默认60s）未领取视为消息丢失、`running`超过`GRADE_HEARTBEAT_TIMEOUT`（默认90s）无心跳视为worker硬崩溃，锁行（`skip_locked`避开活跃计算）后bump代际自动补送；计算期间心跳线程按超时1/3周期刷新`heartbeat_at`，正常计算不会被误回收。旧代际消息/晚回来的旧计算在锁行复查时丢弃，保证不重复出估级、不覆盖补好的结果。归档与DB估值任一边缺失或代际不一致时`artifact_ready=false`，主管核级被拒并由系统补算。这是应用层代际幂等+心跳回收，不是Redis端到端exactly-once投递。
 
 ## 一天的工作剧本
 

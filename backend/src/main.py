@@ -11,10 +11,15 @@ from .schemas import *
 from .common import lock,pack,add,audit,stamp
 from .auth import current,writer,supervisor,verify,token
 from .middleware import Trace,Burst
-from . import auction_service as auction,dispute_service as dispute
+from . import auction_service as auction,dispute_service as dispute,grade_queue as gq
 q=redis.Redis.from_url(os.environ['REDIS_URL'],decode_responses=True)
 @asynccontextmanager
 async def lifespan(app):
+    # 列结构补齐与开关无关，保证旧演示库也具备可靠估级流水线字段。
+    try:
+        from .seed_service import ensure_columns
+        ensure_columns()
+    except Exception:logging.exception('ensure columns failed')
     if os.getenv('SEED_DEMO','true').lower()=='true':
         try:
             from .seed_service import seed
@@ -35,7 +40,17 @@ def login(d:Login,s=Depends(session)):
 def me(u=Depends(current)):return {'email':u.email,'role':u.role}
 @app.get('/archive')
 def archive(s=Depends(session),u=Depends(current)):
-    return {m.__tablename__:[pack(x)for x in s.scalars(select(m).order_by(m.id))]for m in (Clock,Consignment,VaseSample,AuctionSession,AuctionLot,Bid,Deal,Dispute,Settlement)}
+    out={}
+    for m in (Clock,Consignment,VaseSample,AuctionSession,AuctionLot,Bid,Deal,Dispute,Settlement):
+        rows=[]
+        for x in s.scalars(select(m).order_by(m.id)):
+            row=pack(x)
+            if m is VaseSample:
+                # 估值与归档同代际齐备才允许核级，前端按该标志展示“可以核级”。
+                row['artifact_ready']=x.artifact_ready
+            rows.append(row)
+        out[m.__tablename__]=rows
+    return out
 @app.get('/audits')
 def audits(s=Depends(session),u=Depends(current)):return [pack(x)for x in s.scalars(select(Audit).order_by(Audit.id.desc()).limit(50))]
 @app.post('/consignments')
@@ -55,15 +70,20 @@ def sample(d:SampleInput,s=Depends(session),u=Depends(writer)):
 @app.post('/samples/{id}/estimate')
 def estimate(id:int,s=Depends(session),u=Depends(writer)):
     x=lock(s,VaseSample,id)
-    if x.state not in ('recorded','failed'):raise HTTPException(409,'仅新留样或失败评估可估级')
-    x.state='queued';x.error=None;s.commit()
-    try:q.rpush('floral-grade',id)
-    except Exception:x.state='failed';x.error='队列不可用，恢复后可重试';s.commit();raise HTTPException(503,x.error)
+    if x.state not in ('recorded','failed'):raise HTTPException(409,'仅新留样或失败评估可估级，排队或计算中的单子由系统自动接续')
+    try:
+        gq.enqueue(s,q,x,actor=u)
+    except Exception:
+        s.rollback()
+        y=lock(s,VaseSample,id);y.state='failed';y.error='队列不可用，恢复后可重试';s.commit()
+        raise HTTPException(503,y.error)
     return pack(x)
 @app.post('/samples/{id}/approve')
 def grade(id:int,d:GradeInput,s=Depends(session),u=Depends(supervisor)):
     x=lock(s,VaseSample,id)
+    # 估值（DB prediction）与归档（同代际 artifact）齐了才交主管核级。
     if x.state!='ready' or not x.prediction:raise HTTPException(409,'先完成worker寿命估级')
+    if not x.artifact_ready:raise HTTPException(409,'估值归档未齐或不属于本次计算，等待自动补算后再核级')
     x.approved_grade=d.grade;x.review_note=d.note;x.state='approved';audit(s,u,'主管核定等级 '+d.grade);s.commit();return pack(x)
 @app.put('/samples/{id}/observation')
 def observation(id:int,d:ObservationInput,s=Depends(session),u=Depends(writer)):
